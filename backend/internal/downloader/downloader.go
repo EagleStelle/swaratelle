@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -57,32 +58,53 @@ type Downloader struct {
 	MediaDir   string
 	Database   *db.DB
 
+	mu sync.RWMutex
+
 	// progress holds the live percent (0-100) of in-flight downloads, keyed by
 	// video id. It is transient -- never persisted -- and surfaced through the
 	// API by overlaying it onto "downloading" rows.
-	mu       sync.RWMutex
 	progress map[string]int
+
+	// generations gives each queued item a small identity token. Canceling a
+	// pending row marks the current generation as stopped, so an old URL still
+	// buffered in jobs cannot recreate the deleted DB row later.
+	generations map[string]uint64
+	canceled    map[string]uint64
+	active      map[string]*activeDownload
 
 	// jobs is the work queue fed by Enqueue and drained by StartWorker, so the
 	// HTTP handler returns immediately instead of blocking on the download.
-	jobs chan string
+	jobs chan downloadJob
+}
+
+type downloadJob struct {
+	url        string
+	videoID    string
+	generation uint64
+}
+
+type activeDownload struct {
+	cancel     context.CancelFunc
+	done       chan struct{}
+	generation uint64
 }
 
 // StartWorker drains the job queue, running one download at a time with the
 // given long-lived context (not a request context, so downloads outlive the
 // HTTP call that queued them). Call once at startup.
 func (d *Downloader) StartWorker(ctx context.Context) {
-	if d.jobs == nil {
-		d.jobs = make(chan string, 1024)
-	}
+	jobs := d.ensureJobs()
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case url := <-d.jobs:
-				if err := d.DownloadOne(ctx, url); err != nil {
-					log.Printf("download %s: %v", url, err)
+			case job := <-jobs:
+				if d.jobStopped(job) || !d.jobStillWanted(ctx, job) {
+					continue
+				}
+				if err := d.downloadOne(ctx, job.url, job.generation); err != nil && !errors.Is(err, context.Canceled) {
+					log.Printf("download %s: %v", job.url, err)
 				}
 			}
 		}
@@ -93,14 +115,125 @@ func (d *Downloader) StartWorker(ctx context.Context) {
 // buffer is somehow full, the URL is dropped (it stays queryable as a pending
 // row and a later re-queue will pick it up).
 func (d *Downloader) Enqueue(url string) {
-	if d.jobs == nil {
-		d.jobs = make(chan string, 1024)
+	jobs := d.ensureJobs()
+	job := downloadJob{url: url}
+	if videoID, err := ExtractVideoID(url); err == nil {
+		job.videoID = videoID
+		d.mu.Lock()
+		if d.generations == nil {
+			d.generations = make(map[string]uint64)
+		}
+		d.generations[videoID]++
+		job.generation = d.generations[videoID]
+		d.mu.Unlock()
 	}
 	select {
-	case d.jobs <- url:
+	case jobs <- job:
 	default:
 		log.Printf("queue full, dropping %s", url)
 	}
+}
+
+// Cancel stops queued or currently running work for videoID. For pending jobs it
+// records the current generation as canceled so the worker skips the buffered
+// job later; for active jobs it also cancels the process context and waits until
+// DownloadOne has run its cleanup defers.
+func (d *Downloader) Cancel(ctx context.Context, videoID string) error {
+	var active *activeDownload
+
+	d.mu.Lock()
+	if d.canceled == nil {
+		d.canceled = make(map[string]uint64)
+	}
+	generation := d.generations[videoID]
+	if current := d.active[videoID]; current != nil {
+		active = current
+		if current.generation > generation {
+			generation = current.generation
+		}
+	}
+	d.canceled[videoID] = generation
+	d.mu.Unlock()
+
+	if active == nil {
+		return nil
+	}
+	active.cancel()
+	select {
+	case <-active.done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (d *Downloader) ensureJobs() chan downloadJob {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.jobs == nil {
+		d.jobs = make(chan downloadJob, 1024)
+	}
+	return d.jobs
+}
+
+func (d *Downloader) jobStillWanted(ctx context.Context, job downloadJob) bool {
+	if d.Database == nil || job.videoID == "" {
+		return true
+	}
+	rec, err := d.Database.Get(ctx, job.videoID)
+	if err != nil {
+		log.Printf("load queued download %s: %v", job.videoID, err)
+		return false
+	}
+	if rec == nil || rec.Status == db.StatusDone {
+		return false
+	}
+	return true
+}
+
+func (d *Downloader) jobStopped(job downloadJob) bool {
+	if job.videoID == "" {
+		return false
+	}
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	return d.jobStoppedLocked(job.videoID, job.generation)
+}
+
+func (d *Downloader) jobStoppedLocked(videoID string, generation uint64) bool {
+	if generation > 0 {
+		if current, ok := d.generations[videoID]; ok && current != generation {
+			return true
+		}
+	}
+	if canceled, ok := d.canceled[videoID]; ok {
+		if generation == 0 {
+			return canceled == 0
+		}
+		return canceled >= generation
+	}
+	return false
+}
+
+func (d *Downloader) registerActive(videoID string, generation uint64, active *activeDownload) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.jobStoppedLocked(videoID, generation) {
+		return false
+	}
+	if d.active == nil {
+		d.active = make(map[string]*activeDownload)
+	}
+	d.active[videoID] = active
+	return true
+}
+
+func (d *Downloader) unregisterActive(videoID string, active *activeDownload) {
+	d.mu.Lock()
+	if d.active[videoID] == active {
+		delete(d.active, videoID)
+	}
+	d.mu.Unlock()
 }
 
 func (d *Downloader) setProgress(videoID string, pct int) {
@@ -135,9 +268,16 @@ func ExtractVideoID(url string) (string, error) {
 }
 
 func (d *Downloader) DownloadOne(ctx context.Context, url string) error {
+	return d.downloadOne(ctx, url, 0)
+}
+
+func (d *Downloader) downloadOne(ctx context.Context, url string, generation uint64) error {
 	videoID, err := ExtractVideoID(url)
 	if err != nil {
 		return err
+	}
+	if d.jobStopped(downloadJob{videoID: videoID, generation: generation}) {
+		return context.Canceled
 	}
 
 	done, err := d.Database.IsDone(ctx, videoID)
@@ -148,8 +288,30 @@ func (d *Downloader) DownloadOne(ctx context.Context, url string) error {
 		return nil
 	}
 
+	downloadCtx, cancel := context.WithCancel(ctx)
+	active := &activeDownload{
+		cancel:     cancel,
+		done:       make(chan struct{}),
+		generation: generation,
+	}
+	if !d.registerActive(videoID, generation, active) {
+		cancel()
+		return context.Canceled
+	}
+	defer func() {
+		d.unregisterActive(videoID, active)
+		close(active.done)
+		cancel()
+	}()
+	if downloadCtx.Err() != nil {
+		return d.cancelDownload(ctx, videoID)
+	}
+
 	if err := d.Database.MarkDownloading(ctx, videoID, url); err != nil {
 		return fmt.Errorf("mark downloading: %w", err)
+	}
+	if downloadCtx.Err() != nil {
+		return d.cancelDownload(ctx, videoID)
 	}
 
 	workDir, err := os.MkdirTemp(d.ScratchDir, videoID+"-")
@@ -166,12 +328,12 @@ func (d *Downloader) DownloadOne(ctx context.Context, url string) error {
 	// bytes, so poll for it to learn the real title and surface it mid-download.
 	titleStop := make(chan struct{})
 	defer close(titleStop)
-	go d.captureTitle(ctx, workDir, videoID, titleStop)
+	go d.captureTitle(downloadCtx, workDir, videoID, titleStop)
 
 	// No config file: iwaradl runs anonymously and every setting has a flag.
 	// --use-sub-dir puts files under an "<artist>/" folder, and the template
 	// names each file "<title> [<video_id>]". moveMedia preserves that layout.
-	cmd := exec.CommandContext(ctx, d.BinaryPath,
+	cmd := exec.CommandContext(downloadCtx, d.BinaryPath,
 		"--root-dir", workDir,
 		"--use-sub-dir",
 		"--filename-template", "{{title}} [{{video_id}}]",
@@ -180,6 +342,9 @@ func (d *Downloader) DownloadOne(ctx context.Context, url string) error {
 		url,
 	)
 	out, runErr := d.runWithProgress(cmd, videoID)
+	if downloadCtx.Err() != nil {
+		return d.cancelDownload(ctx, videoID)
+	}
 	if runErr != nil {
 		msg := fmt.Sprintf("%v: %s", runErr, truncate(out, 2000))
 		_ = d.Database.MarkFailed(ctx, videoID, "iwaradl run: "+msg)
@@ -192,11 +357,20 @@ func (d *Downloader) DownloadOne(ctx context.Context, url string) error {
 		_ = d.Database.MarkFailed(ctx, videoID, err.Error())
 		return err
 	}
+	if downloadCtx.Err() != nil {
+		_ = os.Remove(finalPath)
+		return d.cancelDownload(ctx, videoID)
+	}
 
 	if err := d.Database.MarkDone(ctx, videoID, finalPath, title, artist, size); err != nil {
 		return fmt.Errorf("mark done: %w", err)
 	}
 	return nil
+}
+
+func (d *Downloader) cancelDownload(ctx context.Context, videoID string) error {
+	_ = d.Database.Delete(ctx, videoID)
+	return context.Canceled
 }
 
 // captureTitle polls the scratch dir for the media file iwaradl creates and,

@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -10,6 +11,7 @@ import (
 	"path"
 	"strconv"
 	"strings"
+	"time"
 
 	"iwaradl-managed/internal/db"
 	"iwaradl-managed/internal/downloader"
@@ -209,9 +211,17 @@ func (s *Server) handleDownloadRecord(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
 		return
 	}
-	if rec != nil && rec.Status != db.StatusFailed {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "only failed downloads can be removed"})
+	if rec != nil && rec.Status == db.StatusDone {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "completed downloads cannot be removed here"})
 		return
+	}
+	if rec != nil && (rec.Status == db.StatusPending || rec.Status == db.StatusDownloading) {
+		cancelCtx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		if err := s.DL.Cancel(cancelCtx, videoID); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+			return
+		}
 	}
 	if err := s.DB.Delete(r.Context(), videoID); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})

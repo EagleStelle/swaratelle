@@ -105,7 +105,7 @@ func TestDeleteDownloadRecordRemovesRow(t *testing.T) {
 	}
 }
 
-func TestDeleteDownloadRecordRejectsActiveRow(t *testing.T) {
+func TestDeleteDownloadRecordCancelsPendingRow(t *testing.T) {
 	server := newTestServer(t)
 	ctx := context.Background()
 	if err := server.DB.MarkPending(ctx, "pending-1", "https://example.com/pending-1"); err != nil {
@@ -115,15 +115,45 @@ func TestDeleteDownloadRecordRejectsActiveRow(t *testing.T) {
 	rr := httptest.NewRecorder()
 	server.handleDownloadRecord(rr, httptest.NewRequest(http.MethodDelete, "/api/downloads/pending-1", nil))
 
-	if rr.Code != http.StatusConflict {
-		t.Fatalf("status code = %d, want %d", rr.Code, http.StatusConflict)
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", rr.Code, http.StatusOK)
 	}
 	rec, err := server.DB.Get(ctx, "pending-1")
 	if err != nil {
 		t.Fatalf("Get returned error: %v", err)
 	}
+	if rec != nil {
+		t.Fatalf("expected pending record to be deleted, got %#v", rec)
+	}
+}
+
+func TestDeleteDownloadRecordRejectsDoneRow(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+	if _, err := server.DB.InsertReconciled(
+		ctx,
+		"done-1",
+		"https://example.com/done-1",
+		filepath.Join(t.TempDir(), "done-1.mp4"),
+		"Done One",
+		"Artist",
+		1024,
+	); err != nil {
+		t.Fatalf("InsertReconciled returned error: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	server.handleDownloadRecord(rr, httptest.NewRequest(http.MethodDelete, "/api/downloads/done-1", nil))
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status code = %d, want %d", rr.Code, http.StatusConflict)
+	}
+	rec, err := server.DB.Get(ctx, "done-1")
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
 	if rec == nil {
-		t.Fatal("expected pending record to remain")
+		t.Fatal("expected done record to remain")
 	}
 }
 

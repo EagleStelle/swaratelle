@@ -14,8 +14,8 @@ export function AlertDock({ children, className, elevated }: AlertDockProps) {
   return (
     <div
       className={cn(
-        "pointer-events-none fixed inset-x-4 bottom-20 z-40 flex flex-col gap-2 md:inset-x-auto md:bottom-auto md:right-4 md:top-4 md:w-full md:max-w-md",
-        elevated && "bottom-36 md:top-16",
+        "pointer-events-none fixed inset-x-4 bottom-20 z-40 flex flex-col gap-2 md:inset-x-auto md:right-4 md:bottom-4 md:w-full md:max-w-md",
+        elevated && "bottom-36",
         className
       )}
     >

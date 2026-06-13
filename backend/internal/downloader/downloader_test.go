@@ -110,3 +110,65 @@ func TestDownloadOneKeepsFailedRecordWithError(t *testing.T) {
 		t.Fatal("expected error message to be recorded")
 	}
 }
+
+func TestCancelStopsOldQueuedGeneration(t *testing.T) {
+	ctx := context.Background()
+	d := &Downloader{}
+	url := "https://www.iwara.tv/video/abc123/queued-video"
+
+	d.Enqueue(url)
+	oldJob := <-d.jobs
+	if oldJob.videoID != "abc123" {
+		t.Fatalf("queued videoID = %q, want abc123", oldJob.videoID)
+	}
+	if d.jobStopped(oldJob) {
+		t.Fatal("freshly queued job was marked stopped")
+	}
+
+	if err := d.Cancel(ctx, "abc123"); err != nil {
+		t.Fatalf("Cancel returned error: %v", err)
+	}
+	if !d.jobStopped(oldJob) {
+		t.Fatal("canceled queued job was not marked stopped")
+	}
+
+	d.Enqueue(url)
+	newJob := <-d.jobs
+	if d.jobStopped(newJob) {
+		t.Fatal("newly queued generation was marked stopped")
+	}
+	if !d.jobStopped(oldJob) {
+		t.Fatal("old queued generation became runnable after requeue")
+	}
+}
+
+func TestCancelStopsActiveDownload(t *testing.T) {
+	ctx := context.Background()
+	d := &Downloader{
+		generations: map[string]uint64{"abc123": 1},
+	}
+	activeCtx, activeCancel := context.WithCancel(ctx)
+	active := &activeDownload{
+		cancel:     activeCancel,
+		done:       make(chan struct{}),
+		generation: 1,
+	}
+	if !d.registerActive("abc123", 1, active) {
+		t.Fatal("registerActive returned false")
+	}
+	go func() {
+		<-activeCtx.Done()
+		d.unregisterActive("abc123", active)
+		close(active.done)
+	}()
+
+	if err := d.Cancel(ctx, "abc123"); err != nil {
+		t.Fatalf("Cancel returned error: %v", err)
+	}
+	if activeCtx.Err() == nil {
+		t.Fatal("active context was not canceled")
+	}
+	if !d.jobStopped(downloadJob{videoID: "abc123", generation: 1}) {
+		t.Fatal("active generation was not marked stopped")
+	}
+}

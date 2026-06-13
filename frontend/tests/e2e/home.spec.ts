@@ -8,6 +8,46 @@ test("root shows the add form", async ({ page }) => {
   ).toBeVisible();
 });
 
+test("downloads alert appears in the desktop lower right", async ({ page }) => {
+  await page.route("**/api/downloads/active", async (route) => {
+    await route.fulfill({ json: [] });
+  });
+  await page.route("**/api/queue", async (route) => {
+    await route.fulfill({
+      json: [
+        {
+          url: "https://example.com/video",
+          status: "rejected",
+        },
+      ],
+    });
+  });
+
+  const activeDownloadsResponse = page.waitForResponse((response) =>
+    response.url().includes("/api/downloads/active")
+  );
+  await page.goto("/");
+  await activeDownloadsResponse;
+
+  await page.getByRole("textbox").fill("https://example.com/video");
+  await page.getByRole("button", { name: "Download" }).click();
+
+  const alert = page
+    .getByRole("alert")
+    .filter({ hasText: "Link not recognized" });
+  await expect(alert).toContainText("Link not recognized");
+
+  const box = await alert.boundingBox();
+  const viewport = page.viewportSize();
+
+  expect(box).not.toBeNull();
+  expect(viewport).not.toBeNull();
+  expect(box!.x).toBeGreaterThan(viewport!.width / 2);
+  expect(box!.y).toBeGreaterThan(viewport!.height / 2);
+  expect(box!.x + box!.width).toBeLessThanOrEqual(viewport!.width);
+  expect(box!.y + box!.height).toBeLessThanOrEqual(viewport!.height);
+});
+
 test("history page renders the status table", async ({ page }) => {
   await page.goto("/history");
   await expect(page.getByRole("searchbox", { name: "Search history" })).toBeVisible();

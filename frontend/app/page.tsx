@@ -8,6 +8,7 @@ import {
   Info,
   Link,
   Trash2,
+  X,
 } from "lucide-react";
 
 import { AlertDock } from "@/components/alert-dock";
@@ -137,37 +138,35 @@ export default function DownloadsPage() {
 
           return (
             <Card key={r.VideoID} className="gap-3 py-4">
-              <CardHeader>
-                <CardTitle className="min-w-0 truncate pr-2">
+              <CardHeader className="grid-cols-[minmax(0,1fr)_2.25rem] grid-rows-[auto] items-center gap-x-3 gap-y-0 has-data-[slot=card-action]:grid-cols-[minmax(0,1fr)_2.25rem]">
+                <CardTitle className="min-w-0 truncate leading-snug">
                   {title}
                 </CardTitle>
-                {failed && (
-                  <CardAction>
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="icon"
-                      onClick={() => removeDownload.mutate(r.VideoID)}
-                      disabled={removing && removeDownload.isPending}
-                      aria-label={`Remove ${title}`}
-                      className="size-8 text-destructive hover:text-destructive"
-                    >
-                      <Trash2 />
-                    </Button>
-                  </CardAction>
-                )}
+                <CardAction className="row-span-1 self-center justify-self-end">
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="icon"
+                    onClick={() => removeDownload.mutate(r.VideoID)}
+                    disabled={removing && removeDownload.isPending}
+                    aria-label={`${failed ? "Remove" : "Cancel"} ${title}`}
+                    className="size-8 text-destructive hover:text-destructive"
+                  >
+                    {failed ? <Trash2 /> : <X />}
+                  </Button>
+                </CardAction>
               </CardHeader>
-              <CardContent className="flex flex-col gap-2">
+              <CardContent className="grid grid-cols-[minmax(0,1fr)_2.25rem] items-center gap-x-3 gap-y-2">
                 <a
                   href={r.SourceURL}
                   target="_blank"
                   rel="noreferrer"
-                  className="truncate text-sm text-muted-foreground hover:underline"
+                  className="col-span-2 min-w-0 truncate text-sm text-muted-foreground hover:underline"
                 >
                   {r.SourceURL}
                 </a>
                 {failed ? (
-                  <div className="rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
+                  <div className="col-span-2 rounded-md border border-destructive/30 bg-destructive/10 p-3 text-sm text-destructive">
                     <div className="flex items-center gap-2 font-medium">
                       <CircleAlert className="size-4" />
                       Download failed
@@ -177,17 +176,17 @@ export default function DownloadsPage() {
                     </p>
                   </div>
                 ) : (
-                  <div className="flex items-center gap-2">
-                    <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-secondary">
+                  <>
+                    <div className="h-1.5 min-w-0 overflow-hidden rounded-full bg-secondary">
                       <div
                         className="h-full rounded-full bg-primary transition-[width] duration-500"
                         style={{ width: `${r.Progress}%` }}
                       />
                     </div>
-                    <span className="w-9 text-right text-xs tabular-nums text-muted-foreground">
+                    <span className="w-9 justify-self-end text-right text-xs tabular-nums text-muted-foreground">
                       {r.Progress}%
                     </span>
-                  </div>
+                  </>
                 )}
               </CardContent>
             </Card>
