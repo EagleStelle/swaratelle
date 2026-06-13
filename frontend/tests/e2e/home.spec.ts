@@ -48,6 +48,67 @@ test("downloads alert appears in the desktop lower right", async ({ page }) => {
   expect(box!.y + box!.height).toBeLessThanOrEqual(viewport!.height);
 });
 
+test("link input ignores Enter while queue request is pending", async ({ page }) => {
+  await page.route("**/api/downloads/active", async (route) => {
+    await route.fulfill({ json: [] });
+  });
+
+  let queueRequests = 0;
+  let releaseQueue = () => {};
+  const queueHold = new Promise<void>((resolve) => {
+    releaseQueue = resolve;
+  });
+
+  await page.route("**/api/queue", async (route) => {
+    queueRequests += 1;
+    await queueHold;
+    await route.fulfill({
+      json: [
+        {
+          url: "https://www.iwara.tv/video/abc123",
+          status: "queued",
+        },
+      ],
+    });
+  });
+
+  const activeDownloadsResponse = page.waitForResponse((response) =>
+    response.url().includes("/api/downloads/active")
+  );
+  await page.goto("/");
+  await activeDownloadsResponse;
+
+  const input = page.getByRole("textbox");
+  await input.fill("https://www.iwara.tv/video/abc123");
+  await expect(page.getByRole("button", { name: "Download" })).toBeEnabled();
+  const firstQueueRequest = page.waitForRequest((request) =>
+    request.url().includes("/api/queue")
+  );
+  await input.press("Enter");
+  await firstQueueRequest;
+  expect(queueRequests).toBe(1);
+  await expect(page.getByRole("button", { name: "Download" })).toBeDisabled();
+
+  let sawExtraRequest = false;
+  const extraQueueRequest = page
+    .waitForRequest((request) => request.url().includes("/api/queue"), {
+      timeout: 250,
+    })
+    .then(() => {
+      sawExtraRequest = true;
+    })
+    .catch(() => {});
+
+  await input.press("Enter");
+  await extraQueueRequest;
+  releaseQueue();
+
+  expect(sawExtraRequest).toBe(false);
+  expect(queueRequests).toBe(1);
+
+  await expect(input).toHaveValue("");
+});
+
 test("history page renders the status table", async ({ page }) => {
   await page.goto("/history");
   await expect(page.getByRole("searchbox", { name: "Search history" })).toBeVisible();

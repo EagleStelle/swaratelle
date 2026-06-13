@@ -97,7 +97,7 @@ export default function DownloadsPage() {
 
   function submit() {
     const val = url.trim();
-    if (!val) return;
+    if (!val || queue.isPending) return;
     queue.mutate([val], { onSuccess: () => setUrl("") });
   }
 
@@ -203,7 +203,9 @@ export default function DownloadsPage() {
             value={url}
             onChange={(e) => setUrl(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === "Enter") submit();
+              if (e.key !== "Enter" || e.repeat) return;
+              e.preventDefault();
+              submit();
             }}
           />
           <Button

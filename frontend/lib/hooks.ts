@@ -48,9 +48,18 @@ export function useQueueDownloads() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (urls: string[]) => queueDownloads(urls),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["downloads", "active"] });
-      queryClient.invalidateQueries({ queryKey: ["history"] });
+    onSuccess: (results) => {
+      const activeChanged = results.some((result) =>
+        ["queued", "pending", "downloading"].includes(result.status),
+      );
+      const historyChanged = results.some((result) => result.status === "done");
+
+      if (activeChanged) {
+        queryClient.invalidateQueries({ queryKey: ["downloads", "active"] });
+      }
+      if (historyChanged) {
+        queryClient.invalidateQueries({ queryKey: ["history"] });
+      }
     },
   });
 }
