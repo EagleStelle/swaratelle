@@ -1,9 +1,8 @@
 "use client";
 
-import { Suspense, useEffect, useState } from "react";
+import { Suspense, useEffect, useRef, useState } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
 import {
-  ChevronDown,
   CircleAlert,
   CircleCheck,
   RefreshCw,
@@ -93,6 +92,7 @@ function HistoryContent() {
   const searchParams = useSearchParams();
   const activeQuery = searchParams.get("q")?.trim() ?? "";
   const [searchValue, setSearchValue] = useState(activeQuery);
+  const loadMoreRef = useRef<HTMLDivElement | null>(null);
   const history = useHistoryDownloads(activeQuery);
   const scan = useScan();
   const items = history.data?.pages.flatMap((page) => page.records) ?? [];
@@ -100,6 +100,27 @@ function HistoryContent() {
   useEffect(() => {
     setSearchValue(activeQuery);
   }, [activeQuery]);
+
+  useEffect(() => {
+    const sentinel = loadMoreRef.current;
+    if (!sentinel || !history.hasNextPage || history.isFetchingNextPage) {
+      return;
+    }
+
+    let didRequestNextPage = false;
+    const observer = new IntersectionObserver(
+      ([entry]) => {
+        if (entry?.isIntersecting && !didRequestNextPage) {
+          didRequestNextPage = true;
+          void history.fetchNextPage();
+        }
+      },
+      { rootMargin: "320px 0px" },
+    );
+
+    observer.observe(sentinel);
+    return () => observer.disconnect();
+  }, [history.fetchNextPage, history.hasNextPage, history.isFetchingNextPage]);
 
   function pushSearch(nextQuery: string) {
     const params = new URLSearchParams(searchParams.toString());
@@ -190,19 +211,21 @@ function HistoryContent() {
         </TableBody>
       </Table>
 
-      {history.hasNextPage && (
-        <div className="flex justify-center">
-          <Button
-            variant="outline"
-            size="sm"
-            onClick={() => history.fetchNextPage()}
-            disabled={history.isFetchingNextPage}
+      <div
+        ref={loadMoreRef}
+        aria-hidden={!history.hasNextPage}
+        className="min-h-10"
+        data-testid="history-scroll-sentinel"
+      >
+        {history.isFetchingNextPage && (
+          <div
+            role="status"
+            className="flex justify-center py-2 text-sm text-muted-foreground"
           >
-            <ChevronDown />
-            {history.isFetchingNextPage ? "Loading..." : "Load more"}
-          </Button>
-        </div>
-      )}
+            Loading more...
+          </div>
+        )}
+      </div>
 
       <div className="order-last sticky bottom-16 z-40 -mx-4 mt-auto flex items-center gap-2 border-t bg-slate-100 p-4 dark:bg-background md:static md:bottom-auto md:order-first md:mx-0 md:mt-0 md:border-0 md:bg-transparent md:p-0 md:dark:bg-transparent">
         <div className="relative flex-1">

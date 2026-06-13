@@ -148,6 +148,64 @@ test("history search updates and clears the URL", async ({ page }) => {
   await expect(page).toHaveURL(/\/history\/?$/);
 });
 
+test("history automatically loads the next page near the bottom", async ({
+  page,
+}) => {
+  const record = (index: number) => ({
+    VideoID: `history-${index}`,
+    SourceURL: `https://example.com/video-${index}`,
+    FilePath: "",
+    FileSize: 1048576,
+    Title: `History video ${index}`,
+    Artist: "Example artist",
+    Error: "",
+    Attempts: 1,
+    CreatedAt: index,
+    UpdatedAt: index,
+    Progress: 100,
+  });
+
+  await page.route("**/api/history?**", async (route) => {
+    const url = new URL(route.request().url());
+    const cursor = url.searchParams.get("cursor");
+
+    await route.fulfill({
+      json:
+        cursor === "next-page"
+          ? { records: [record(51)], next_cursor: "" }
+          : {
+              records: Array.from({ length: 50 }, (_, index) =>
+                record(index + 1),
+              ),
+              next_cursor: "next-page",
+            },
+    });
+  });
+
+  const initialHistoryResponse = page.waitForResponse(
+    (response) =>
+      response.url().includes("/api/history") &&
+      !response.url().includes("cursor="),
+  );
+  await page.goto("/history");
+  await initialHistoryResponse;
+
+  await expect(page.getByRole("button", { name: /load more/i })).toHaveCount(0);
+
+  const nextPageRequest = page.waitForRequest((request) => {
+    const url = new URL(request.url());
+    return (
+      url.pathname.endsWith("/api/history") &&
+      url.searchParams.get("cursor") === "next-page"
+    );
+  });
+
+  await page.getByTestId("history-scroll-sentinel").scrollIntoViewIfNeeded();
+  await nextPageRequest;
+
+  await expect(page.getByText("History video 51")).toBeVisible();
+});
+
 test("sidebar navigates between pages", async ({ page }) => {
   await page.goto("/");
   await page.getByRole("link", { name: "History" }).click();

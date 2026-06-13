@@ -14,7 +14,7 @@
 - Queue Iwara video URLs from a browser UI.
 - Track active downloads with progress parsed from `iwaradl`.
 - Deduplicate downloads by Iwara `video_id`.
-- Browse and search completed or failed download history.
+- Browse and search completed download history.
 - Reconcile history against files on disk.
 - Expose a token-protected API for scripts and server-to-server integrations.
 
@@ -127,8 +127,8 @@ Authorization: Bearer <SWARATELLE_API_TOKEN>
 | ------ | ------------------------------------------------ | ---------------------------------------------------------------------------- |
 | `GET`  | `/api/health`                                    | Liveness check.                                                              |
 | `GET`  | `/api/downloads`                                 | Lists all download records.                                                  |
-| `GET`  | `/api/downloads/active`                          | Lists pending and downloading records with live progress.                    |
-| `GET`  | `/api/history?limit=50&cursor=<cursor>&q=<term>` | Lists completed and failed records, with pagination and title/artist search. |
+| `GET`  | `/api/downloads/active`                          | Lists pending, downloading, and failed records with live progress when available. |
+| `GET`  | `/api/history?limit=50&cursor=<cursor>&q=<term>` | Lists completed records, with cursor pagination and title/artist search.     |
 | `POST` | `/api/queue`                                     | Queues one or more Iwara video URLs.                                         |
 | `POST` | `/api/scan`                                      | Reconciles database history with files currently present in `/media`.        |
 
