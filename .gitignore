@@ -1,0 +1,23 @@
+node_modules/
+.next/
+out/
+dist/
+build/
+# Local runtime data + build/test artifacts
+local/
+.local/
+playwright-report/
+test-results/
+next-env.d.ts
+/media/
+/data/
+/scratch/
+*.db
+*.sqlite
+*.sqlite3
+*.list
+.env
+backend/service
+iwaradl
+.DS_Store
+npm-debug.log*

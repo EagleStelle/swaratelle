@@ -1,0 +1,13 @@
+services:
+  swaratelle:
+    image: eaglestelle/swaratelle:latest
+    container_name: swaratelle
+    ports:
+      - "8842:8842"
+    volumes:
+      - ./data:/data
+      - ./media:/media
+      - ./scratch:/scratch
+    environment:
+      SWARATELLE_API_TOKEN: "replace-this-with-a-long-random-token"
+    restart: unless-stopped
