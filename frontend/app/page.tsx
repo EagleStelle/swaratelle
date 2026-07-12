@@ -64,7 +64,7 @@ function getQueueFeedback(result?: QueueResult): QueueFeedback | null {
     case "rejected":
       return {
         title: "Link not recognized",
-        description: "Paste a valid Iwara video URL.",
+        description: "Paste a valid Iwara or Oreno3D video URL.",
         icon: "error",
         variant: "destructive",
       };
@@ -171,7 +171,7 @@ export default function DownloadsPage() {
                       <CircleAlert className="size-4" />
                       Download failed
                     </div>
-                    <p className="mt-1 whitespace-pre-wrap break-words text-xs">
+                    <p className="mt-1 whitespace-pre-wrap wrap-break-words text-xs">
                       {r.Error}
                     </p>
                   </div>

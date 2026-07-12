@@ -18,10 +18,11 @@ import (
 )
 
 type Server struct {
-	DL     *downloader.Downloader
-	DB     *db.DB
-	Token  string
-	WebDir string
+	DL         *downloader.Downloader
+	DB         *db.DB
+	Token      string
+	WebDir     string
+	ResolveURL func(context.Context, string) (string, error)
 }
 
 type queueRequest struct {
@@ -378,8 +379,16 @@ func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
 
 	results := make([]queueResult, 0, len(req.URLs))
 	for _, url := range req.URLs {
+		url = strings.TrimSpace(url)
 		res := queueResult{URL: url}
-		vid, err := downloader.ExtractVideoID(url)
+		resolvedURL, err := s.resolveURL(r.Context(), url)
+		if err != nil {
+			res.Status = "rejected"
+			res.Error = err.Error()
+			results = append(results, res)
+			continue
+		}
+		vid, err := downloader.ExtractVideoID(resolvedURL)
 		if err != nil {
 			res.Status = "rejected"
 			res.Error = err.Error()
@@ -399,17 +408,24 @@ func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
 
 		// Record it as pending so it shows up instantly, then hand off to the
 		// background worker and return without waiting for the download.
-		if err := s.DB.MarkPending(r.Context(), vid, url); err != nil {
+		if err := s.DB.MarkPending(r.Context(), vid, resolvedURL); err != nil {
 			res.Status = "failed"
 			res.Error = err.Error()
 			results = append(results, res)
 			continue
 		}
-		s.DL.Enqueue(url)
+		s.DL.Enqueue(resolvedURL)
 		res.Status = "queued"
 		results = append(results, res)
 	}
 	writeJSON(w, http.StatusOK, results)
+}
+
+func (s *Server) resolveURL(ctx context.Context, raw string) (string, error) {
+	if s.ResolveURL != nil {
+		return s.ResolveURL(ctx, raw)
+	}
+	return downloader.ResolveSourceURL(ctx, raw)
 }
 
 // handleScan reconciles the DB with disk in both directions:

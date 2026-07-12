@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"iwaradl-managed/internal/db"
@@ -154,6 +155,52 @@ func TestDeleteDownloadRecordRejectsDoneRow(t *testing.T) {
 	}
 	if rec == nil {
 		t.Fatal("expected done record to remain")
+	}
+}
+
+func TestHandleQueueResolvesOreno3DURLBeforeQueueing(t *testing.T) {
+	server := newTestServer(t)
+	const (
+		orenoURL = "https://oreno3d.com/movies/347601"
+		iwaraURL = "https://www.iwara.tv/video/CNCQNZEfKO8QYI/mmdparty-tonight-jane-doe"
+	)
+	server.ResolveURL = func(ctx context.Context, raw string) (string, error) {
+		if raw != orenoURL {
+			t.Fatalf("ResolveURL raw = %q, want %q", raw, orenoURL)
+		}
+		return iwaraURL, nil
+	}
+
+	rr := httptest.NewRecorder()
+	body := strings.NewReader(`{"urls":["` + orenoURL + `"]}`)
+	server.handleQueue(rr, httptest.NewRequest(http.MethodPost, "/api/queue", body))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", rr.Code, http.StatusOK)
+	}
+	var results []queueResult
+	if err := json.NewDecoder(rr.Body).Decode(&results); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(results) != 1 {
+		t.Fatalf("len(results) = %d, want 1", len(results))
+	}
+	if results[0].Status != "queued" {
+		t.Fatalf("Status = %q, want queued", results[0].Status)
+	}
+	if results[0].VideoID != "CNCQNZEfKO8QYI" {
+		t.Fatalf("VideoID = %q, want CNCQNZEfKO8QYI", results[0].VideoID)
+	}
+
+	rec, err := server.DB.Get(context.Background(), "CNCQNZEfKO8QYI")
+	if err != nil {
+		t.Fatalf("Get returned error: %v", err)
+	}
+	if rec == nil {
+		t.Fatal("expected queued record")
+	}
+	if rec.SourceURL != iwaraURL {
+		t.Fatalf("SourceURL = %q, want %q", rec.SourceURL, iwaraURL)
 	}
 }
 

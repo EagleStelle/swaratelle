@@ -11,7 +11,7 @@
 
 ## Features
 
-- Queue Iwara video URLs from a browser UI.
+- Queue Iwara video URLs or Oreno3D movie pages from a browser UI.
 - Track active downloads with progress parsed from `iwaradl`.
 - Deduplicate downloads by Iwara `video_id`.
 - Browse and search completed download history.
@@ -129,7 +129,7 @@ Authorization: Bearer <SWARATELLE_API_TOKEN>
 | `GET`  | `/api/downloads`                                 | Lists all download records.                                                  |
 | `GET`  | `/api/downloads/active`                          | Lists pending, downloading, and failed records with live progress when available. |
 | `GET`  | `/api/history?limit=50&cursor=<cursor>&q=<term>` | Lists completed records, with cursor pagination and title/artist search.     |
-| `POST` | `/api/queue`                                     | Queues one or more Iwara video URLs.                                         |
+| `POST` | `/api/queue`                                     | Queues one or more Iwara video URLs or Oreno3D movie pages.                  |
 | `POST` | `/api/scan`                                      | Reconciles database history with files currently present in `/media`.        |
 
 Queue example:
@@ -138,7 +138,7 @@ Queue example:
 curl -X POST http://localhost:8842/api/queue \
   -H "Authorization: Bearer $SWARATELLE_API_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"urls":["https://www.iwara.tv/video/abc123"]}'
+  -d '{"urls":["https://www.iwara.tv/video/abc123","https://oreno3d.com/movies/347601"]}'
 ```
 
 ## Development
