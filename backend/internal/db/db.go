@@ -105,7 +105,7 @@ func (d *DB) IsDone(ctx context.Context, videoID string) (bool, error) {
 }
 
 // MarkPending records a queued download so it shows up immediately, before the
-// background worker picks it up. A finished or in-flight row is left as-is; a
+// downloader scheduler picks it up. A finished or in-flight row is left as-is; a
 // previously failed one is reset to pending so it can be retried.
 func (d *DB) MarkPending(ctx context.Context, videoID, url string) error {
 	now := time.Now().Unix()
@@ -261,6 +261,49 @@ func (d *DB) queryRecords(ctx context.Context, query string, args ...any) ([]Rec
 		out = append(out, r)
 	}
 	return out, rows.Err()
+}
+
+// StatusCounts is the number of rows in each status, plus the total. Zero
+// values are meaningful (a status with no rows), so every field is always
+// present rather than sourced from a sparse GROUP BY result.
+type StatusCounts struct {
+	Pending     int
+	Downloading int
+	Done        int
+	Failed      int
+	Total       int
+}
+
+// Counts returns the row count per status in a single grouped scan, so callers
+// can read the completed (done) total without walking the paginated history.
+func (d *DB) Counts(ctx context.Context) (StatusCounts, error) {
+	rows, err := d.conn.QueryContext(ctx,
+		`SELECT status, COUNT(*) FROM downloads GROUP BY status`)
+	if err != nil {
+		return StatusCounts{}, err
+	}
+	defer rows.Close()
+
+	var c StatusCounts
+	for rows.Next() {
+		var status string
+		var n int
+		if err := rows.Scan(&status, &n); err != nil {
+			return StatusCounts{}, err
+		}
+		switch Status(status) {
+		case StatusPending:
+			c.Pending = n
+		case StatusDownloading:
+			c.Downloading = n
+		case StatusDone:
+			c.Done = n
+		case StatusFailed:
+			c.Failed = n
+		}
+		c.Total += n
+	}
+	return c, rows.Err()
 }
 
 func (d *DB) Get(ctx context.Context, videoID string) (*Record, error) {

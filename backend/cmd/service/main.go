@@ -6,6 +6,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -26,6 +28,7 @@ const (
 
 func main() {
 	apiToken := os.Getenv("SWARATELLE_API_TOKEN")
+	downloadConcurrency := positiveIntEnv("SWARATELLE_DOWNLOAD_CONCURRENCY", 1)
 
 	for _, dir := range []string{dataDir, mediaDir, scratchDir} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -40,17 +43,19 @@ func main() {
 	defer database.Close()
 
 	dl := &downloader.Downloader{
-		BinaryPath: binPath,
-		ScratchDir: scratchDir,
-		MediaDir:   mediaDir,
-		Database:   database,
+		BinaryPath:     binPath,
+		ScratchDir:     scratchDir,
+		MediaDir:       mediaDir,
+		Database:       database,
+		MaxConcurrency: downloadConcurrency,
 	}
 
-	// Downloads run on a background worker so the HTTP queue endpoint returns
-	// immediately. Tie its lifetime to a context cancelled on shutdown.
-	workerCtx, cancelWorker := context.WithCancel(context.Background())
-	defer cancelWorker()
-	dl.StartWorker(workerCtx)
+	// Downloads are scheduled on demand: no downloader goroutine exists while
+	// the queue is idle, and active iwaradl processes are capped by the env var.
+	downloadCtx, cancelDownloads := context.WithCancel(context.Background())
+	defer cancelDownloads()
+	dl.Start(downloadCtx)
+	log.Printf("download concurrency: %d", downloadConcurrency)
 
 	srv := &api.Server{DL: dl, DB: database, Token: apiToken, WebDir: webDir}
 
@@ -77,4 +82,17 @@ func main() {
 		log.Printf("shutdown error: %v", err)
 	}
 	log.Println("stopped")
+}
+
+func positiveIntEnv(name string, fallback int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	n, err := strconv.Atoi(raw)
+	if err != nil || n < 1 {
+		log.Printf("invalid %s=%q; using %d", name, raw, fallback)
+		return fallback
+	}
+	return n
 }

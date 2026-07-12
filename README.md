@@ -32,6 +32,7 @@ services:
     restart: unless-stopped
     environment:
       SWARATELLE_API_TOKEN: "replace-this-with-a-long-random-token"
+      SWARATELLE_DOWNLOAD_CONCURRENCY: "2"
     volumes:
       - ./data:/data
       - ./media:/media
@@ -88,11 +89,12 @@ docker start swaratelle
 
 ## Configuration
 
-Swaratelle has one runtime environment variable. Set it inline in Docker Compose or pass it to `docker run`.
+Swaratelle has two runtime environment variables. Set them inline in Docker Compose or pass them to `docker run`.
 
-| Variable               |    Required | Description                                                                                    |
-| ---------------------- | ----------: | ---------------------------------------------------------------------------------------------- |
-| `SWARATELLE_API_TOKEN` | Recommended | Shared API token for queue, history, and scan endpoints. Keep it server-side for integrations. |
+| Variable                         |    Required | Description                                                                                         |
+| -------------------------------- | ----------: | --------------------------------------------------------------------------------------------------- |
+| `SWARATELLE_API_TOKEN`           | Recommended | Shared API token for queue, history, and scan endpoints. Keep it server-side for integrations.      |
+| `SWARATELLE_DOWNLOAD_CONCURRENCY` |          No | Maximum number of `iwaradl` download processes to run at once. Defaults to `1` when unset/invalid. |
 
 If `SWARATELLE_API_TOKEN` is empty, API routes are open to anyone who can reach the service. For shared or network-accessible deployments, set a strong token and control access at the network or reverse-proxy layer.
 
@@ -110,7 +112,7 @@ Storage is configured with Docker bind mounts. Container paths are fixed:
 | --------------- | ----------------------------------------------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------- |
 | Runtime service | `backend/cmd/service`                                 | Go `net/http`                  | Starts the API server, serves the exported frontend, opens SQLite, configures the downloader, and handles shutdown.                 |
 | API layer       | `backend/internal/api`                                | Go                             | Defines HTTP routes, token/session authentication, JSON responses, history pagination, static serving, and disk scan orchestration. |
-| Download worker | `backend/internal/downloader`                         | Go + `iwaradl`                 | Extracts video IDs, queues work, launches `iwaradl`, parses progress, moves completed media, and reconciles files from disk.        |
+| Download scheduler | `backend/internal/downloader`                      | Go + `iwaradl`                 | Extracts video IDs, queues work, launches concurrent `iwaradl` processes on demand, parses progress, moves completed media, and reconciles files from disk. |
 | Persistence     | `backend/internal/db`                                 | SQLite                         | Stores download records, status transitions, deduplication, history queries, indexes, and cursor pagination.                        |
 | Frontend app    | `frontend/app`, `frontend/components`, `frontend/lib` | Next.js, React, TanStack Query | Provides the Downloads and History screens, UI primitives, same-origin API client, polling, mutations, and formatting.              |
 | Tests           | `backend/internal/**/_test.go`, `frontend/tests`      | Go test, Vitest, Playwright    | Covers persistence, disk reconciliation, UI primitives, utilities, and browser flows.                                               |

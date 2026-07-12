@@ -55,6 +55,16 @@ type historyResponse struct {
 	NextCursor string           `json:"next_cursor,omitempty"`
 }
 
+// countsResponse exposes the per-status row totals so clients can read the
+// completed count directly instead of walking every history page.
+type countsResponse struct {
+	Pending     int `json:"pending"`
+	Downloading int `json:"downloading"`
+	Done        int `json:"done"`
+	Failed      int `json:"failed"`
+	Total       int `json:"total"`
+}
+
 type historyCursor struct {
 	UpdatedAt int64  `json:"updated_at"`
 	VideoID   string `json:"video_id"`
@@ -72,6 +82,7 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/downloads/", s.auth(s.handleDownloadRecord))
 	mux.HandleFunc("/api/downloads", s.auth(s.handleDownloads))
 	mux.HandleFunc("/api/history", s.auth(s.handleHistory))
+	mux.HandleFunc("/api/counts", s.auth(s.handleCounts))
 	mux.HandleFunc("/api/queue", s.auth(s.handleQueue))
 	mux.HandleFunc("/api/scan", s.auth(s.handleScan))
 	if s.WebDir != "" {
@@ -285,6 +296,25 @@ func (s *Server) handleHistory(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+func (s *Server) handleCounts(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	counts, err := s.DB.Counts(r.Context())
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, countsResponse{
+		Pending:     counts.Pending,
+		Downloading: counts.Downloading,
+		Done:        counts.Done,
+		Failed:      counts.Failed,
+		Total:       counts.Total,
+	})
+}
+
 func recordResponses(records []db.Record) []recordResponse {
 	out := make([]recordResponse, 0, len(records))
 	for _, r := range records {
@@ -407,7 +437,7 @@ func (s *Server) handleQueue(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Record it as pending so it shows up instantly, then hand off to the
-		// background worker and return without waiting for the download.
+		// on-demand scheduler and return without waiting for the download.
 		if err := s.DB.MarkPending(r.Context(), vid, resolvedURL); err != nil {
 			res.Status = "failed"
 			res.Error = err.Error()

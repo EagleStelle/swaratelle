@@ -158,6 +158,48 @@ func TestDeleteDownloadRecordRejectsDoneRow(t *testing.T) {
 	}
 }
 
+func TestHandleCountsGroupsByStatus(t *testing.T) {
+	server := newTestServer(t)
+	ctx := context.Background()
+
+	// One done row via reconcile, one pending, one failed.
+	if _, err := server.DB.InsertReconciled(
+		ctx,
+		"done-1",
+		"https://example.com/done-1",
+		filepath.Join(t.TempDir(), "done-1.mp4"),
+		"Done One",
+		"Artist",
+		1024,
+	); err != nil {
+		t.Fatalf("InsertReconciled returned error: %v", err)
+	}
+	if err := server.DB.MarkPending(ctx, "pending-1", "https://example.com/pending-1"); err != nil {
+		t.Fatalf("MarkPending returned error: %v", err)
+	}
+	if err := server.DB.MarkPending(ctx, "failed-1", "https://example.com/failed-1"); err != nil {
+		t.Fatalf("MarkPending returned error: %v", err)
+	}
+	if err := server.DB.MarkFailed(ctx, "failed-1", "network unavailable"); err != nil {
+		t.Fatalf("MarkFailed returned error: %v", err)
+	}
+
+	rr := httptest.NewRecorder()
+	server.handleCounts(rr, httptest.NewRequest(http.MethodGet, "/api/counts", nil))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", rr.Code, http.StatusOK)
+	}
+	var got countsResponse
+	if err := json.NewDecoder(rr.Body).Decode(&got); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	want := countsResponse{Pending: 1, Downloading: 0, Done: 1, Failed: 1, Total: 3}
+	if got != want {
+		t.Fatalf("counts = %#v, want %#v", got, want)
+	}
+}
+
 func TestHandleQueueResolvesOreno3DURLBeforeQueueing(t *testing.T) {
 	server := newTestServer(t)
 	const (

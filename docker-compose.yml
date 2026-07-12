@@ -10,4 +10,5 @@ services:
       - ./scratch:/scratch
     environment:
       SWARATELLE_API_TOKEN: "replace-this-with-a-long-random-token"
+      SWARATELLE_DOWNLOAD_CONCURRENCY: "2"
     restart: unless-stopped

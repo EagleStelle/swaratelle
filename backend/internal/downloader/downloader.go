@@ -21,11 +21,18 @@ import (
 	"iwaradl-managed/internal/db"
 )
 
-// maxNameBytes is the per-path-component limit on the common Linux filesystems
-// (ext4, btrfs) the media volume runs on: 255 *bytes*, not characters. Multibyte
-// UTF-8 titles (e.g. CJK at 3 bytes/char) blow past it fast and trip
-// ENAMETOOLONG (Errno 36) on save, so every component we create is capped.
-const maxNameBytes = 255
+const (
+	// maxNameBytes is the per-path-component limit on the common Linux
+	// filesystems (ext4, btrfs) the media volume runs on: 255 *bytes*, not
+	// characters. Multibyte UTF-8 titles (e.g. CJK at 3 bytes/char) blow past it
+	// fast and trip ENAMETOOLONG (Errno 36) on save, so every component we
+	// create is capped.
+	maxNameBytes = 255
+
+	// Keep the old channel's bound so an accidental burst cannot grow the queue
+	// without limit.
+	maxQueuedDownloads = 1024
+)
 
 var videoIDRe = regexp.MustCompile(`/video/([A-Za-z0-9]+)`)
 
@@ -58,6 +65,10 @@ type Downloader struct {
 	MediaDir   string
 	Database   *db.DB
 
+	// MaxConcurrency is the maximum number of iwaradl processes to run at once.
+	// Values less than 1 fall back to one-at-a-time downloads.
+	MaxConcurrency int
+
 	mu sync.RWMutex
 
 	// progress holds the live percent (0-100) of in-flight downloads, keyed by
@@ -66,15 +77,20 @@ type Downloader struct {
 	progress map[string]int
 
 	// generations gives each queued item a small identity token. Canceling a
-	// pending row marks the current generation as stopped, so an old URL still
-	// buffered in jobs cannot recreate the deleted DB row later.
+	// pending row marks the current generation as stopped, so an old queued URL
+	// cannot recreate the deleted DB row later.
 	generations map[string]uint64
 	canceled    map[string]uint64
 	active      map[string]*activeDownload
 
-	// jobs is the work queue fed by Enqueue and drained by StartWorker, so the
-	// HTTP handler returns immediately instead of blocking on the download.
-	jobs chan downloadJob
+	// queue is fed by Enqueue and drained by the on-demand scheduler. No
+	// downloader goroutine sits idle when this queue is empty.
+	queue   []downloadJob
+	running int
+	runCtx  context.Context
+
+	// downloadFunc lets tests exercise scheduling without launching iwaradl.
+	downloadFunc func(context.Context, string, uint64) error
 }
 
 type downloadJob struct {
@@ -89,53 +105,48 @@ type activeDownload struct {
 	generation uint64
 }
 
-// StartWorker drains the job queue, running one download at a time with the
-// given long-lived context (not a request context, so downloads outlive the
-// HTTP call that queued them). Call once at startup.
-func (d *Downloader) StartWorker(ctx context.Context) {
-	jobs := d.ensureJobs()
-	go func() {
-		for {
-			select {
-			case <-ctx.Done():
-				return
-			case job := <-jobs:
-				if d.jobStopped(job) || !d.jobStillWanted(ctx, job) {
-					continue
-				}
-				if err := d.downloadOne(ctx, job.url, job.generation); err != nil && !errors.Is(err, context.Canceled) {
-					log.Printf("download %s: %v", job.url, err)
-				}
-			}
-		}
-	}()
+// Start gives the downloader a long-lived context (not a request context) so
+// queued downloads outlive the HTTP call that queued them. It does not start an
+// idle worker; goroutines are created only while downloads are actually running.
+func (d *Downloader) Start(ctx context.Context) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	d.mu.Lock()
+	d.runCtx = ctx
+	d.scheduleLocked()
+	d.mu.Unlock()
 }
 
-// Enqueue adds a URL to the work queue. It never blocks the caller: if the
-// buffer is somehow full, the URL is dropped (it stays queryable as a pending
-// row and a later re-queue will pick it up).
+// Enqueue adds a URL to the in-memory queue and kicks the on-demand scheduler.
+// It returns immediately; if Start has not been called yet, the item simply
+// waits in memory until Start provides the service lifetime context.
 func (d *Downloader) Enqueue(url string) {
-	jobs := d.ensureJobs()
 	job := downloadJob{url: url}
 	if videoID, err := ExtractVideoID(url); err == nil {
 		job.videoID = videoID
-		d.mu.Lock()
+	}
+
+	d.mu.Lock()
+	if len(d.queue) >= maxQueuedDownloads {
+		d.mu.Unlock()
+		log.Printf("queue full, dropping %s", url)
+		return
+	}
+	if job.videoID != "" {
 		if d.generations == nil {
 			d.generations = make(map[string]uint64)
 		}
-		d.generations[videoID]++
-		job.generation = d.generations[videoID]
-		d.mu.Unlock()
+		d.generations[job.videoID]++
+		job.generation = d.generations[job.videoID]
 	}
-	select {
-	case jobs <- job:
-	default:
-		log.Printf("queue full, dropping %s", url)
-	}
+	d.queue = append(d.queue, job)
+	d.scheduleLocked()
+	d.mu.Unlock()
 }
 
 // Cancel stops queued or currently running work for videoID. For pending jobs it
-// records the current generation as canceled so the worker skips the buffered
+// records the current generation as canceled so the scheduler skips the queued
 // job later; for active jobs it also cancels the process context and waits until
 // DownloadOne has run its cleanup defers.
 func (d *Downloader) Cancel(ctx context.Context, videoID string) error {
@@ -153,6 +164,9 @@ func (d *Downloader) Cancel(ctx context.Context, videoID string) error {
 		}
 	}
 	d.canceled[videoID] = generation
+	d.removeQueuedLocked(videoID, generation)
+	d.scheduleLocked()
+	d.trimEmptyStateLocked()
 	d.mu.Unlock()
 
 	if active == nil {
@@ -167,13 +181,111 @@ func (d *Downloader) Cancel(ctx context.Context, videoID string) error {
 	}
 }
 
-func (d *Downloader) ensureJobs() chan downloadJob {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	if d.jobs == nil {
-		d.jobs = make(chan downloadJob, 1024)
+func (d *Downloader) scheduleLocked() {
+	if d.runCtx == nil || d.runCtx.Err() != nil {
+		return
 	}
-	return d.jobs
+	for d.running < d.maxConcurrencyLocked() && len(d.queue) > 0 {
+		job := d.queue[0]
+		copy(d.queue, d.queue[1:])
+		d.queue[len(d.queue)-1] = downloadJob{}
+		d.queue = d.queue[:len(d.queue)-1]
+		if len(d.queue) == 0 {
+			d.queue = nil
+		}
+		d.running++
+		ctx := d.runCtx
+		download := d.downloadOne
+		if d.downloadFunc != nil {
+			download = d.downloadFunc
+		}
+		go d.runScheduledJob(ctx, job, download)
+	}
+}
+
+func (d *Downloader) runScheduledJob(ctx context.Context, job downloadJob, download func(context.Context, string, uint64) error) {
+	defer d.finishScheduledJob(job)
+
+	if d.jobStopped(job) || !d.jobStillWanted(ctx, job) {
+		return
+	}
+
+	if err := download(ctx, job.url, job.generation); err != nil && !errors.Is(err, context.Canceled) {
+		log.Printf("download %s: %v", job.url, err)
+	}
+}
+
+func (d *Downloader) finishScheduledJob(job downloadJob) {
+	d.mu.Lock()
+	if d.running > 0 {
+		d.running--
+	}
+	d.cleanupJobLocked(job)
+	d.scheduleLocked()
+	d.trimEmptyStateLocked()
+	d.mu.Unlock()
+}
+
+func (d *Downloader) maxConcurrencyLocked() int {
+	if d.MaxConcurrency < 1 {
+		return 1
+	}
+	return d.MaxConcurrency
+}
+
+func (d *Downloader) cleanupJobLocked(job downloadJob) {
+	if job.videoID == "" || d.queueContainsLocked(job.videoID) {
+		return
+	}
+	if d.active[job.videoID] != nil {
+		return
+	}
+	delete(d.generations, job.videoID)
+	delete(d.canceled, job.videoID)
+}
+
+func (d *Downloader) removeQueuedLocked(videoID string, generation uint64) {
+	if videoID == "" || len(d.queue) == 0 {
+		return
+	}
+	kept := d.queue[:0]
+	for _, job := range d.queue {
+		if job.videoID == videoID && (generation == 0 || job.generation <= generation) {
+			continue
+		}
+		kept = append(kept, job)
+	}
+	for i := len(kept); i < len(d.queue); i++ {
+		d.queue[i] = downloadJob{}
+	}
+	d.queue = kept
+}
+
+func (d *Downloader) queueContainsLocked(videoID string) bool {
+	for _, job := range d.queue {
+		if job.videoID == videoID {
+			return true
+		}
+	}
+	return false
+}
+
+func (d *Downloader) trimEmptyStateLocked() {
+	if len(d.queue) == 0 {
+		d.queue = nil
+	}
+	if len(d.progress) == 0 {
+		d.progress = nil
+	}
+	if len(d.active) == 0 {
+		d.active = nil
+	}
+	if len(d.generations) == 0 {
+		d.generations = nil
+	}
+	if len(d.canceled) == 0 {
+		d.canceled = nil
+	}
 }
 
 func (d *Downloader) jobStillWanted(ctx context.Context, job downloadJob) bool {
@@ -233,6 +345,7 @@ func (d *Downloader) unregisterActive(videoID string, active *activeDownload) {
 	if d.active[videoID] == active {
 		delete(d.active, videoID)
 	}
+	d.trimEmptyStateLocked()
 	d.mu.Unlock()
 }
 
@@ -248,6 +361,7 @@ func (d *Downloader) setProgress(videoID string, pct int) {
 func (d *Downloader) clearProgress(videoID string) {
 	d.mu.Lock()
 	delete(d.progress, videoID)
+	d.trimEmptyStateLocked()
 	d.mu.Unlock()
 }
 
@@ -337,7 +451,11 @@ func (d *Downloader) downloadOne(ctx context.Context, url string, generation uin
 		"--root-dir", workDir,
 		"--use-sub-dir",
 		"--filename-template", "{{title}} [{{video_id}}]",
-		"--thread-num", "4",
+		// We run one iwaradl process per video and cap real concurrency with
+		// MaxConcurrency (SWARATELLE_DOWNLOAD_CONCURRENCY). iwaradl's --thread-num is
+		// the number of concurrent *videos* in its own list, so with a single URL
+		// anything above 1 just spawns idle worker goroutines.
+		"--thread-num", "1",
 		"--max-retry", "3",
 		url,
 	)

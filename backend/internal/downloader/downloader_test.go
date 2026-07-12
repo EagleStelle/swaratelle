@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"iwaradl-managed/internal/db"
 )
@@ -117,7 +118,10 @@ func TestCancelStopsOldQueuedGeneration(t *testing.T) {
 	url := "https://www.iwara.tv/video/abc123/queued-video"
 
 	d.Enqueue(url)
-	oldJob := <-d.jobs
+	if len(d.queue) != 1 {
+		t.Fatalf("queued jobs = %d, want 1", len(d.queue))
+	}
+	oldJob := d.queue[0]
 	if oldJob.videoID != "abc123" {
 		t.Fatalf("queued videoID = %q, want abc123", oldJob.videoID)
 	}
@@ -128,17 +132,93 @@ func TestCancelStopsOldQueuedGeneration(t *testing.T) {
 	if err := d.Cancel(ctx, "abc123"); err != nil {
 		t.Fatalf("Cancel returned error: %v", err)
 	}
+	if len(d.queue) != 0 {
+		t.Fatalf("queued jobs after cancel = %d, want 0", len(d.queue))
+	}
 	if !d.jobStopped(oldJob) {
 		t.Fatal("canceled queued job was not marked stopped")
 	}
 
 	d.Enqueue(url)
-	newJob := <-d.jobs
+	if len(d.queue) != 1 {
+		t.Fatalf("queued jobs after requeue = %d, want 1", len(d.queue))
+	}
+	newJob := d.queue[0]
 	if d.jobStopped(newJob) {
 		t.Fatal("newly queued generation was marked stopped")
 	}
 	if !d.jobStopped(oldJob) {
 		t.Fatal("old queued generation became runnable after requeue")
+	}
+}
+
+func TestOnDemandSchedulerHonorsMaxConcurrencyAndStopsIdle(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	started := make(chan string, 3)
+	finished := make(chan struct{}, 3)
+	release := make(chan struct{})
+
+	d := &Downloader{MaxConcurrency: 2}
+	d.downloadFunc = func(ctx context.Context, url string, generation uint64) error {
+		videoID, err := ExtractVideoID(url)
+		if err != nil {
+			return err
+		}
+		started <- videoID
+		select {
+		case <-release:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+		finished <- struct{}{}
+		return nil
+	}
+	d.Start(ctx)
+
+	d.Enqueue("https://www.iwara.tv/video/one111/one")
+	d.Enqueue("https://www.iwara.tv/video/two222/two")
+	d.Enqueue("https://www.iwara.tv/video/three333/three")
+
+	waitForStarted(t, started)
+	waitForStarted(t, started)
+	select {
+	case videoID := <-started:
+		t.Fatalf("third download %q started before a concurrency slot opened", videoID)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	d.mu.RLock()
+	running, queued := d.running, len(d.queue)
+	d.mu.RUnlock()
+	if running != 2 {
+		t.Fatalf("running = %d, want 2", running)
+	}
+	if queued != 1 {
+		t.Fatalf("queued = %d, want 1", queued)
+	}
+
+	close(release)
+	waitForStarted(t, started)
+	waitForFinished(t, finished)
+	waitForFinished(t, finished)
+	waitForFinished(t, finished)
+
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.running != 0 {
+		t.Fatalf("running after completion = %d, want 0", d.running)
+	}
+	if len(d.queue) != 0 {
+		t.Fatalf("queue after completion = %d, want 0", len(d.queue))
+	}
+	if d.queue != nil {
+		t.Fatal("queue retained backing storage after becoming idle")
+	}
+	if d.active != nil || d.progress != nil || d.generations != nil || d.canceled != nil {
+		t.Fatalf("idle state retained maps: active=%v progress=%v generations=%v canceled=%v",
+			d.active != nil, d.progress != nil, d.generations != nil, d.canceled != nil)
 	}
 }
 
@@ -170,5 +250,25 @@ func TestCancelStopsActiveDownload(t *testing.T) {
 	}
 	if !d.jobStopped(downloadJob{videoID: "abc123", generation: 1}) {
 		t.Fatal("active generation was not marked stopped")
+	}
+}
+
+func waitForStarted(t *testing.T, started <-chan string) string {
+	t.Helper()
+	select {
+	case videoID := <-started:
+		return videoID
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for download to start")
+		return ""
+	}
+}
+
+func waitForFinished(t *testing.T, finished <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-finished:
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for download to finish")
 	}
 }
