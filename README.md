@@ -141,8 +141,19 @@ Authorization: Bearer <SWARATELLE_API_TOKEN>
 | `GET`  | `/api/downloads`                                 | Lists all download records.                                                       |
 | `GET`  | `/api/downloads/active`                          | Lists pending, downloading, and failed records with live progress when available. |
 | `GET`  | `/api/history?limit=50&cursor=<cursor>&q=<term>` | Lists completed records, with cursor pagination and title/artist search.          |
+| `GET`  | `/api/downloads/{video_id}/file`                 | Streams the completed media file for a `done` record (supports HTTP range/resume). |
 | `POST` | `/api/queue`                                     | Queues one or more Iwara video URLs or Oreno3D movie pages.                       |
 | `POST` | `/api/scan`                                      | Reconciles database history with files currently present in `/media`.             |
+
+The file endpoint returns the raw media bytes with a `Content-Disposition` attachment header. It responds `409` when the record exists but is not yet complete, and `404` when the record is unknown or its file has been removed from disk. External clients (e.g. never-stelle) read the completed list from `/api/history`, then pull each file by its `video_id`.
+
+Download example:
+
+```sh
+curl -L -o clip.mp4 \
+  -H "Authorization: Bearer $SWARATELLE_API_TOKEN" \
+  http://localhost:8842/api/downloads/abc123/file
+```
 
 Queue example:
 

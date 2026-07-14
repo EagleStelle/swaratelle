@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import {
   CircleAlert,
   CircleCheck,
+  Download,
   RefreshCw,
   Search,
   X,
@@ -22,7 +23,7 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import type { ScanResult } from "@/lib/api";
+import { downloadFileURL, type ScanResult } from "@/lib/api";
 import { useHistoryDownloads, useScan } from "@/lib/hooks";
 import { displayName, formatSize } from "@/lib/format";
 
@@ -75,11 +76,14 @@ function HistoryFallback() {
             <TableHead>Artist</TableHead>
             <TableHead>URL</TableHead>
             <TableHead>Size</TableHead>
+            <TableHead className="w-0 text-right">
+              <span className="sr-only">Download</span>
+            </TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
           <TableRow>
-            <TableCell colSpan={4}>Loading...</TableCell>
+            <TableCell colSpan={5}>Loading...</TableCell>
           </TableRow>
         </TableBody>
       </Table>
@@ -178,12 +182,15 @@ function HistoryContent() {
             <TableHead>Artist</TableHead>
             <TableHead>URL</TableHead>
             <TableHead>Size</TableHead>
+            <TableHead className="w-0 text-right">
+              <span className="sr-only">Download</span>
+            </TableHead>
           </TableRow>
         </TableHeader>
         <TableBody>
           {history.isLoading || (history.isError && items.length === 0) ? (
             <TableRow>
-              <TableCell colSpan={4}>
+              <TableCell colSpan={5}>
                 {history.isLoading ? "Loading..." : "Error loading history."}
               </TableCell>
             </TableRow>
@@ -205,6 +212,18 @@ function HistoryContent() {
                   </a>
                 </TableCell>
                 <TableCell>{formatSize(r.FileSize)}</TableCell>
+                <TableCell className="text-right">
+                  <Button
+                    asChild
+                    variant="ghost"
+                    size="icon"
+                    aria-label={`Download ${displayName(r)}`}
+                  >
+                    <a href={downloadFileURL(r.VideoID)} download>
+                      <Download />
+                    </a>
+                  </Button>
+                </TableCell>
               </TableRow>
             ))
           )}
