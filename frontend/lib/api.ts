@@ -87,6 +87,13 @@ export async function removeDownload(videoID: string): Promise<void> {
   }
 }
 
+// Same-origin URL of the completed media file for a video id. The UI's session
+// cookie (or the bearer token, for external clients like never-stelle) authorizes
+// it; only "done" records resolve to bytes, everything else returns 404/409.
+export function downloadFileURL(videoID: string): string {
+  return `${API_BASE}/api/downloads/${encodeURIComponent(videoID)}/file`;
+}
+
 export async function queueDownloads(urls: string[]): Promise<QueueResult[]> {
   const res = await fetch(`${API_BASE}/api/queue`, {
     method: "POST",

@@ -6,10 +6,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -104,6 +107,10 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/auth/logout", s.handleAuthLogout)
 	mux.HandleFunc("/api/auth/credentials", s.handleAuthCredentials)
 	mux.HandleFunc("/api/downloads/active", s.auth(s.handleActiveDownloads))
+	// The completed media file itself, streamed for external clients (never-stelle)
+	// and the UI download button. More specific than the "/api/downloads/" subtree
+	// below, so Go 1.22's ServeMux routes it here.
+	mux.HandleFunc("GET /api/downloads/{video_id}/file", s.auth(s.handleDownloadFile))
 	mux.HandleFunc("/api/downloads/", s.auth(s.handleDownloadRecord))
 	mux.HandleFunc("/api/downloads", s.auth(s.handleDownloads))
 	mux.HandleFunc("/api/history", s.auth(s.handleHistory))
@@ -360,6 +367,103 @@ func (s *Server) handleDownloadRecord(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+// handleDownloadFile streams the completed media file for a video id so external
+// clients (never-stelle) and the UI can pull the actual bytes, not just the
+// metadata row. Only "done" rows have a file on disk; anything else is 409/404.
+// http.ServeContent supplies Content-Type, Content-Length, Range, and
+// If-Modified-Since handling, so large files stream and downloads are resumable.
+func (s *Server) handleDownloadFile(w http.ResponseWriter, r *http.Request) {
+	videoID := strings.TrimSpace(r.PathValue("video_id"))
+	if videoID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid video id"})
+		return
+	}
+
+	rec, err := s.DB.Get(r.Context(), videoID)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if rec == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "not found"})
+		return
+	}
+	if rec.Status != db.StatusDone || rec.FilePath == "" {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "download is not complete"})
+		return
+	}
+	if !s.mediaPathAllowed(rec.FilePath) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "file path is outside the media directory"})
+		return
+	}
+
+	f, err := os.Open(rec.FilePath)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			// The row still claims a file that has since vanished; a scan would drop
+			// the row. Report it as gone rather than a server error.
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "media file is missing on disk"})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	if info.IsDir() {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "media file is missing on disk"})
+		return
+	}
+
+	name := filepath.Base(rec.FilePath)
+	w.Header().Set("Content-Disposition", contentDisposition(name))
+	http.ServeContent(w, r, name, info.ModTime(), f)
+}
+
+// mediaPathAllowed guards against serving a record whose stored path escaped the
+// media root. Paths are written by our own downloader/scan, so this is defense
+// in depth; it is skipped when the media dir is unknown (e.g. in tests).
+func (s *Server) mediaPathAllowed(p string) bool {
+	root := ""
+	if s.DL != nil {
+		root = s.DL.MediaDir
+	}
+	if root == "" {
+		return true
+	}
+	absRoot, err := filepath.Abs(root)
+	if err != nil {
+		return false
+	}
+	absPath, err := filepath.Abs(p)
+	if err != nil {
+		return false
+	}
+	rel, err := filepath.Rel(absRoot, absPath)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// contentDisposition builds an attachment header that survives non-ASCII titles:
+// a sanitized ASCII fallback for old clients plus an RFC 5987 filename* carrying
+// the UTF-8 name percent-encoded.
+func contentDisposition(name string) string {
+	ascii := strings.Map(func(r rune) rune {
+		if r < 0x20 || r > 0x7e || r == '"' || r == '\\' {
+			return '_'
+		}
+		return r
+	}, name)
+	return fmt.Sprintf(`attachment; filename="%s"; filename*=UTF-8''%s`, ascii, url.PathEscape(name))
 }
 
 func (s *Server) handleActiveDownloads(w http.ResponseWriter, r *http.Request) {

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -159,6 +160,96 @@ func TestDeleteDownloadRecordRejectsDoneRow(t *testing.T) {
 	}
 }
 
+func TestDownloadFileServesCompletedMedia(t *testing.T) {
+	server := newTestServerWithAuth(t)
+	ctx := context.Background()
+
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "Clip One [vid-1].mp4")
+	payload := []byte("fake-mp4-bytes")
+	if err := os.WriteFile(filePath, payload, 0o600); err != nil {
+		t.Fatalf("write media file: %v", err)
+	}
+	if _, err := server.DB.InsertReconciled(ctx, "vid-1", "https://example.com/vid-1", filePath, "Clip One", "Artist", int64(len(payload))); err != nil {
+		t.Fatalf("InsertReconciled returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/downloads/vid-1/file", nil)
+	req.Header.Set("Authorization", "Bearer "+server.Token)
+	rr := httptest.NewRecorder()
+	server.Routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d (body: %s)", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	if got := rr.Body.String(); got != string(payload) {
+		t.Fatalf("body = %q, want %q", got, string(payload))
+	}
+	if cd := rr.Header().Get("Content-Disposition"); !strings.Contains(cd, "attachment") || !strings.Contains(cd, "Clip One [vid-1].mp4") {
+		t.Fatalf("Content-Disposition = %q, want attachment with filename", cd)
+	}
+}
+
+func TestDownloadFileRejectsIncomplete(t *testing.T) {
+	server := newTestServerWithAuth(t)
+	ctx := context.Background()
+	if err := server.DB.MarkPending(ctx, "pending-1", "https://example.com/pending-1"); err != nil {
+		t.Fatalf("MarkPending returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/downloads/pending-1/file", nil)
+	req.Header.Set("Authorization", "Bearer "+server.Token)
+	rr := httptest.NewRecorder()
+	server.Routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusConflict {
+		t.Fatalf("status code = %d, want %d", rr.Code, http.StatusConflict)
+	}
+}
+
+func TestDownloadFileMissingRowIsNotFound(t *testing.T) {
+	server := newTestServerWithAuth(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/downloads/nope/file", nil)
+	req.Header.Set("Authorization", "Bearer "+server.Token)
+	rr := httptest.NewRecorder()
+	server.Routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status code = %d, want %d", rr.Code, http.StatusNotFound)
+	}
+}
+
+func TestDownloadFileMissingOnDiskIsNotFound(t *testing.T) {
+	server := newTestServerWithAuth(t)
+	ctx := context.Background()
+	// A done row whose file was deleted out from under it.
+	gonePath := filepath.Join(t.TempDir(), "gone [vid-2].mp4")
+	if _, err := server.DB.InsertReconciled(ctx, "vid-2", "https://example.com/vid-2", gonePath, "Gone", "Artist", 10); err != nil {
+		t.Fatalf("InsertReconciled returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/downloads/vid-2/file", nil)
+	req.Header.Set("Authorization", "Bearer "+server.Token)
+	rr := httptest.NewRecorder()
+	server.Routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusNotFound {
+		t.Fatalf("status code = %d, want %d", rr.Code, http.StatusNotFound)
+	}
+}
+
+func TestDownloadFileRequiresAuth(t *testing.T) {
+	server := newTestServerWithAuth(t)
+
+	rr := httptest.NewRecorder()
+	server.Routes().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/downloads/vid-1/file", nil))
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status code = %d, want %d", rr.Code, http.StatusUnauthorized)
+	}
+}
+
 func TestHandleCountsGroupsByStatus(t *testing.T) {
 	server := newTestServer(t)
 	ctx := context.Background()
@@ -255,6 +346,86 @@ func TestBusinessEndpointRequiresAuth(t *testing.T) {
 
 	if rr.Code != http.StatusUnauthorized {
 		t.Fatalf("status code = %d, want %d", rr.Code, http.StatusUnauthorized)
+	}
+}
+
+// TestBusinessEndpointsAllRequireAuth is the lockdown guard: every /api/* route
+// that touches data must return 401 before running any handler logic when the
+// request carries no bearer token and no session cookie. It drives the real mux
+// (not the handlers directly) so routing, method matching, and the auth wrapper
+// are all exercised together. Add every new business route here.
+func TestBusinessEndpointsAllRequireAuth(t *testing.T) {
+	server := newTestServerWithAuth(t)
+
+	cases := []struct{ method, path string }{
+		{http.MethodGet, "/api/downloads"},
+		{http.MethodGet, "/api/downloads/active"},
+		{http.MethodGet, "/api/downloads/some-id/file"},
+		{http.MethodDelete, "/api/downloads/some-id"},
+		{http.MethodGet, "/api/history"},
+		{http.MethodGet, "/api/counts"},
+		{http.MethodPost, "/api/queue"},
+		{http.MethodPost, "/api/scan"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.method+" "+tc.path, func(t *testing.T) {
+			rr := httptest.NewRecorder()
+			server.Routes().ServeHTTP(rr, httptest.NewRequest(tc.method, tc.path, nil))
+			if rr.Code != http.StatusUnauthorized {
+				t.Fatalf("status code = %d, want %d (body: %s)", rr.Code, http.StatusUnauthorized, rr.Body.String())
+			}
+		})
+	}
+}
+
+// TestAuthSessionDoesNotLeakToUnauthenticated confirms the one unauthenticated
+// data endpoint (the SPA's session probe) reveals nothing about the account to a
+// caller with no valid cookie: authenticated=false and an empty username.
+func TestAuthSessionDoesNotLeakToUnauthenticated(t *testing.T) {
+	server := newTestServerWithAuth(t)
+
+	rr := httptest.NewRecorder()
+	server.Routes().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/auth/session", nil))
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", rr.Code, http.StatusOK)
+	}
+	var resp authSessionResponse
+	if err := json.NewDecoder(rr.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if resp.Authenticated {
+		t.Fatal("unauthenticated session probe reported authenticated=true")
+	}
+	if resp.Username != "" {
+		t.Fatalf("username leaked to unauthenticated caller: %q", resp.Username)
+	}
+}
+
+// TestDownloadFileWrongBearerRejected confirms a bad token cannot pull bytes even
+// for a real completed row -- the file endpoint fails closed like the rest.
+func TestDownloadFileWrongBearerRejected(t *testing.T) {
+	server := newTestServerWithAuth(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	filePath := filepath.Join(dir, "Clip [vid-x].mp4")
+	if err := os.WriteFile(filePath, []byte("secret-bytes"), 0o600); err != nil {
+		t.Fatalf("write media file: %v", err)
+	}
+	if _, err := server.DB.InsertReconciled(ctx, "vid-x", "https://example.com/vid-x", filePath, "Clip", "Artist", 12); err != nil {
+		t.Fatalf("InsertReconciled returned error: %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/downloads/vid-x/file", nil)
+	req.Header.Set("Authorization", "Bearer not-the-real-token")
+	rr := httptest.NewRecorder()
+	server.Routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status code = %d, want %d", rr.Code, http.StatusUnauthorized)
+	}
+	if strings.Contains(rr.Body.String(), "secret-bytes") {
+		t.Fatal("rejected request still leaked file bytes")
 	}
 }
 
