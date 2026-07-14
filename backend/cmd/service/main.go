@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"iwaradl-managed/internal/api"
+	"iwaradl-managed/internal/auth"
 	"iwaradl-managed/internal/db"
 	"iwaradl-managed/internal/downloader"
 )
@@ -57,7 +58,16 @@ func main() {
 	dl.Start(downloadCtx)
 	log.Printf("download concurrency: %d", downloadConcurrency)
 
-	srv := &api.Server{DL: dl, DB: database, Token: apiToken, WebDir: webDir}
+	// Seed the UI login account (from env or defaults) on first boot. This only
+	// gates the bundled web UI; external API clients keep using the bearer token.
+	authMgr := auth.NewManager(database)
+	authSettings, err := authMgr.EnsureAuthSettings(context.Background())
+	if err != nil {
+		log.Fatalf("init auth: %v", err)
+	}
+	log.Printf("web UI login user: %q", authSettings.Username)
+
+	srv := &api.Server{DL: dl, DB: database, Auth: authMgr, Token: apiToken, WebDir: webDir}
 
 	httpSrv := &http.Server{
 		Addr:              listenAddr,

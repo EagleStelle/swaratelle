@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"iwaradl-managed/internal/auth"
 	"iwaradl-managed/internal/db"
 	"iwaradl-managed/internal/downloader"
 )
@@ -246,6 +247,102 @@ func TestHandleQueueResolvesOreno3DURLBeforeQueueing(t *testing.T) {
 	}
 }
 
+func TestBusinessEndpointRequiresAuth(t *testing.T) {
+	server := newTestServerWithAuth(t)
+
+	rr := httptest.NewRecorder()
+	server.Routes().ServeHTTP(rr, httptest.NewRequest(http.MethodGet, "/api/history", nil))
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status code = %d, want %d", rr.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestBearerTokenAuthorizes(t *testing.T) {
+	server := newTestServerWithAuth(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/history", nil)
+	req.Header.Set("Authorization", "Bearer "+server.Token)
+	rr := httptest.NewRecorder()
+	server.Routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want %d", rr.Code, http.StatusOK)
+	}
+}
+
+func TestLoginSetsCookieThatAuthorizes(t *testing.T) {
+	server := newTestServerWithAuth(t)
+
+	cookie := loginForCookie(t, server, "root", "swaratelle")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/history", nil)
+	req.AddCookie(cookie)
+	rr := httptest.NewRecorder()
+	server.Routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("authorized request status = %d, want %d", rr.Code, http.StatusOK)
+	}
+}
+
+func TestLoginRejectsBadPassword(t *testing.T) {
+	server := newTestServerWithAuth(t)
+
+	rr := httptest.NewRecorder()
+	body := strings.NewReader(`{"username":"root","password":"nope"}`)
+	server.Routes().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/auth/login", body))
+
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("status code = %d, want %d", rr.Code, http.StatusUnauthorized)
+	}
+}
+
+func TestCredentialsUpdateFlow(t *testing.T) {
+	server := newTestServerWithAuth(t)
+	cookie := loginForCookie(t, server, "root", "swaratelle")
+
+	rr := httptest.NewRecorder()
+	body := strings.NewReader(`{"current_password":"swaratelle","username":"root","new_password":"newpassword123"}`)
+	req := httptest.NewRequest(http.MethodPost, "/api/auth/credentials", body)
+	req.AddCookie(cookie)
+	server.Routes().ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("credentials update status = %d, want %d (body: %s)", rr.Code, http.StatusOK, rr.Body.String())
+	}
+
+	// New password now works; old one no longer does.
+	loginForCookie(t, server, "root", "newpassword123")
+	if code := loginStatus(server, "root", "swaratelle"); code != http.StatusUnauthorized {
+		t.Fatalf("old password login status = %d, want %d", code, http.StatusUnauthorized)
+	}
+}
+
+func loginStatus(server *Server, username, password string) int {
+	rr := httptest.NewRecorder()
+	body := strings.NewReader(`{"username":"` + username + `","password":"` + password + `"}`)
+	server.Routes().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/auth/login", body))
+	return rr.Code
+}
+
+func loginForCookie(t *testing.T, server *Server, username, password string) *http.Cookie {
+	t.Helper()
+	rr := httptest.NewRecorder()
+	body := strings.NewReader(`{"username":"` + username + `","password":"` + password + `"}`)
+	server.Routes().ServeHTTP(rr, httptest.NewRequest(http.MethodPost, "/api/auth/login", body))
+	if rr.Code != http.StatusOK {
+		t.Fatalf("login status = %d, want %d (body: %s)", rr.Code, http.StatusOK, rr.Body.String())
+	}
+	for _, c := range rr.Result().Cookies() {
+		if c.Name == auth.SessionCookie {
+			return c
+		}
+	}
+	t.Fatal("login did not set a session cookie")
+	return nil
+}
+
 func newTestServer(t *testing.T) *Server {
 	t.Helper()
 
@@ -262,6 +359,34 @@ func newTestServer(t *testing.T) *Server {
 	return &Server{
 		DB: database,
 		DL: &downloader.Downloader{},
+	}
+}
+
+func newTestServerWithAuth(t *testing.T) *Server {
+	t.Helper()
+	t.Setenv("SWARATELLE_USERNAME", "root")
+	t.Setenv("SWARATELLE_PASSWORD", "swaratelle")
+
+	database, err := db.Open(filepath.Join(t.TempDir(), "downloads.db"))
+	if err != nil {
+		t.Fatalf("Open returned error: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := database.Close(); err != nil {
+			t.Fatalf("Close returned error: %v", err)
+		}
+	})
+
+	authMgr := auth.NewManager(database)
+	if _, err := authMgr.EnsureAuthSettings(context.Background()); err != nil {
+		t.Fatalf("EnsureAuthSettings returned error: %v", err)
+	}
+
+	return &Server{
+		DB:    database,
+		DL:    &downloader.Downloader{},
+		Auth:  authMgr,
+		Token: "test-bearer-token",
 	}
 }
 

@@ -1,6 +1,7 @@
 services:
   swaratelle:
     image: eaglestelle/swaratelle:latest
+    build: .
     container_name: swaratelle
     ports:
       - "8842:8842"
@@ -9,6 +10,9 @@ services:
       - ./media:/media
       - ./scratch:/scratch
     environment:
-      SWARATELLE_API_TOKEN: "replace-this-with-a-long-random-token"
-      SWARATELLE_DOWNLOAD_CONCURRENCY: "2"
+      SWARATELLE_USERNAME: "${SWARATELLE_USERNAME:-root}"
+      SWARATELLE_PASSWORD: "${SWARATELLE_PASSWORD:-swaratelle}"
+      SWARATELLE_API_TOKEN: "${SWARATELLE_API_TOKEN:-replace-this-with-a-long-random-token}"
+      SWARATELLE_DOWNLOAD_CONCURRENCY: "${SWARATELLE_DOWNLOAD_CONCURRENCY:-2}"
+      SWARATELLE_COOKIE_SECURE: "${SWARATELLE_COOKIE_SECURE:-false}"
     restart: unless-stopped

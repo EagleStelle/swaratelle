@@ -4,9 +4,9 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { PanelLeftClose, PanelLeftOpen } from "lucide-react";
 
+import { AccountMenu } from "@/components/auth/account-menu";
 import { LogoMark } from "@/components/logo-mark";
 import { NAV, isActive } from "@/components/nav-items";
-import { ThemeToggle } from "@/components/theme-toggle";
 import { Button } from "@/components/ui/button";
 import { useSidebarStore } from "@/lib/ui-store";
 
@@ -93,7 +93,7 @@ export function NavSide() {
       </nav>
 
       <div className="border-t border-sidebar-border p-2">
-        <ThemeToggle collapsed={collapsed} />
+        <AccountMenu variant={collapsed ? "sidebar-collapsed" : "sidebar"} />
       </div>
     </aside>
   );

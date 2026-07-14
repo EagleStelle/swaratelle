@@ -1,5 +1,13 @@
 import { expect, test } from "@playwright/test";
 
+// The UI is gated by a login; treat every e2e session as already signed in so
+// the app shell renders instead of the login screen.
+test.beforeEach(async ({ page }) => {
+  await page.route("**/api/auth/session", async (route) => {
+    await route.fulfill({ json: { authenticated: true, username: "root" } });
+  });
+});
+
 test("root shows the add form", async ({ page }) => {
   await page.goto("/");
   await expect(page.getByRole("button", { name: "Download" })).toBeVisible();

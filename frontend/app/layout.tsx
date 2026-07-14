@@ -1,8 +1,7 @@
 import type { Metadata } from "next";
 
 import "./globals.css";
-import { NavSide } from "@/components/nav-side";
-import { NavBottom } from "@/components/nav-bottom";
+import { AuthGate } from "@/components/auth/auth-gate";
 import { ThemeFavicon } from "@/components/theme-favicon";
 import { Providers } from "./providers";
 
@@ -36,13 +35,7 @@ export default function RootLayout({
       <body>
         <Providers>
           <ThemeFavicon />
-          <div className="flex min-h-screen">
-            <NavSide />
-            <main className="flex min-w-0 flex-1 flex-col bg-slate-100 p-4 pb-0 dark:bg-background">
-              {children}
-            </main>
-          </div>
-          <NavBottom />
+          <AuthGate>{children}</AuthGate>
         </Providers>
       </body>
     </html>

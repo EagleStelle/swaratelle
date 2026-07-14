@@ -34,6 +34,11 @@ WHERE status IN ('pending','downloading','failed');
 CREATE INDEX IF NOT EXISTS idx_downloads_history_order
 ON downloads(updated_at DESC, video_id DESC)
 WHERE status = 'done';
+
+CREATE TABLE IF NOT EXISTS settings (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 `
 
 type Status string
@@ -304,6 +309,30 @@ func (d *DB) Counts(ctx context.Context) (StatusCounts, error) {
 		c.Total += n
 	}
 	return c, rows.Err()
+}
+
+// GetSetting reads a single settings row. ok is false when the key is absent,
+// so callers can tell "unset" from an empty stored value.
+func (d *DB) GetSetting(ctx context.Context, key string) (string, bool, error) {
+	var value string
+	err := d.conn.QueryRowContext(ctx,
+		`SELECT value FROM settings WHERE key = ?`, key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return value, true, nil
+}
+
+// SetSetting upserts a settings row.
+func (d *DB) SetSetting(ctx context.Context, key, value string) error {
+	_, err := d.conn.ExecContext(ctx,
+		`INSERT INTO settings (key, value) VALUES (?, ?)
+		 ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+		key, value)
+	return err
 }
 
 func (d *DB) Get(ctx context.Context, videoID string) (*Record, error) {

@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -13,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"iwaradl-managed/internal/auth"
 	"iwaradl-managed/internal/db"
 	"iwaradl-managed/internal/downloader"
 )
@@ -20,9 +22,26 @@ import (
 type Server struct {
 	DL         *downloader.Downloader
 	DB         *db.DB
+	Auth       *auth.Manager
 	Token      string
 	WebDir     string
 	ResolveURL func(context.Context, string) (string, error)
+}
+
+type authSessionResponse struct {
+	Authenticated bool   `json:"authenticated"`
+	Username      string `json:"username"`
+}
+
+type loginRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type credentialsRequest struct {
+	CurrentPassword string `json:"current_password"`
+	Username        string `json:"username"`
+	NewPassword     string `json:"new_password"`
 }
 
 type queueRequest struct {
@@ -78,6 +97,12 @@ const (
 func (s *Server) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/health", s.handleHealth)
+	// Auth endpoints authorize themselves; they must stay outside s.auth so the
+	// login screen can reach them while unauthenticated.
+	mux.HandleFunc("/api/auth/session", s.handleAuthSession)
+	mux.HandleFunc("/api/auth/login", s.handleAuthLogin)
+	mux.HandleFunc("/api/auth/logout", s.handleAuthLogout)
+	mux.HandleFunc("/api/auth/credentials", s.handleAuthCredentials)
 	mux.HandleFunc("/api/downloads/active", s.auth(s.handleActiveDownloads))
 	mux.HandleFunc("/api/downloads/", s.auth(s.handleDownloadRecord))
 	mux.HandleFunc("/api/downloads", s.auth(s.handleDownloads))
@@ -86,7 +111,9 @@ func (s *Server) Routes() http.Handler {
 	mux.HandleFunc("/api/queue", s.auth(s.handleQueue))
 	mux.HandleFunc("/api/scan", s.auth(s.handleScan))
 	if s.WebDir != "" {
-		mux.Handle("/", s.withSession(s.staticHandler()))
+		// Static files (including the login page) are served unauthenticated; the
+		// SPA self-gates via /api/auth/session and the /api/* endpoints enforce.
+		mux.Handle("/", s.staticHandler())
 	}
 	return mux
 }
@@ -145,30 +172,9 @@ func (s *Server) staticHandler() http.Handler {
 	})
 }
 
-const sessionCookie = "swaratelle_session"
-
-// withSession plants the API token as a same-site cookie while serving the
-// bundled UI, so the browser authenticates automatically against the
-// same-origin API. The user never has to paste the token; external API clients
-// still use the Bearer header.
-func (s *Server) withSession(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if s.Token != "" {
-			http.SetCookie(w, &http.Cookie{
-				Name:     sessionCookie,
-				Value:    s.Token,
-				Path:     "/",
-				HttpOnly: true,
-				SameSite: http.SameSiteStrictMode,
-			})
-		}
-		next.ServeHTTP(w, r)
-	})
-}
-
 func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		if s.Token != "" && !s.authorized(r) {
+		if !s.authorized(r) {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 			return
 		}
@@ -176,21 +182,135 @@ func (s *Server) auth(next http.HandlerFunc) http.HandlerFunc {
 	}
 }
 
-// authorized accepts either a Bearer header (external clients) or the session
-// cookie set by withSession (the bundled UI).
+// authorized accepts either the optional Bearer API token (external/integration
+// clients such as never-stelle) or a valid signed session cookie (the bundled
+// UI login). Either one grants access to the /api/* business endpoints.
 func (s *Server) authorized(r *http.Request) bool {
-	h := r.Header.Get("Authorization")
-	if strings.HasPrefix(h, "Bearer ") && strings.TrimPrefix(h, "Bearer ") == s.Token {
-		return true
+	if s.Token != "" {
+		h := r.Header.Get("Authorization")
+		if strings.HasPrefix(h, "Bearer ") &&
+			subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(h, "Bearer ")), []byte(s.Token)) == 1 {
+			return true
+		}
 	}
-	if c, err := r.Cookie(sessionCookie); err == nil && c.Value == s.Token {
-		return true
+	if s.Auth != nil {
+		if sess, err := s.Auth.SessionFromRequest(r.Context(), r); err == nil && sess != nil {
+			return true
+		}
 	}
 	return false
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// handleAuthSession reports whether the current request carries a valid session
+// cookie, so the SPA can decide between the login screen and the app shell.
+func (s *Server) handleAuthSession(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	sess := s.currentSession(r)
+	if sess == nil {
+		writeJSON(w, http.StatusOK, authSessionResponse{Authenticated: false})
+		return
+	}
+	writeJSON(w, http.StatusOK, authSessionResponse{Authenticated: true, Username: sess.Username})
+}
+
+func (s *Server) handleAuthLogin(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if s.Auth == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "auth not configured"})
+		return
+	}
+	var req loginRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	settings, err := s.Auth.Authenticate(r.Context(), req.Username, req.Password)
+	if err != nil {
+		if errors.Is(err, auth.ErrInvalidCredentials) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "Invalid username or password."})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	token, err := s.Auth.CreateSessionToken(settings)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	s.Auth.SetSessionCookie(w, token)
+	writeJSON(w, http.StatusOK, authSessionResponse{Authenticated: true, Username: settings.Username})
+}
+
+func (s *Server) handleAuthLogout(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if s.Auth != nil {
+		s.Auth.ClearSessionCookie(w)
+	}
+	writeJSON(w, http.StatusOK, authSessionResponse{Authenticated: false})
+}
+
+func (s *Server) handleAuthCredentials(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"error": "method not allowed"})
+		return
+	}
+	if s.Auth == nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "auth not configured"})
+		return
+	}
+	if s.currentSession(r) == nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+		return
+	}
+	var req credentialsRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid json"})
+		return
+	}
+	settings, err := s.Auth.UpdateCredentials(r.Context(), req.CurrentPassword, req.Username, req.NewPassword)
+	if err != nil {
+		var v *auth.ValidationError
+		if errors.As(err, &v) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": v.Message})
+			return
+		}
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	// The version bump invalidated the caller's old cookie; hand back a fresh one
+	// so the current session stays signed in.
+	token, err := s.Auth.CreateSessionToken(settings)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": err.Error()})
+		return
+	}
+	s.Auth.SetSessionCookie(w, token)
+	writeJSON(w, http.StatusOK, authSessionResponse{Authenticated: true, Username: settings.Username})
+}
+
+func (s *Server) currentSession(r *http.Request) *auth.Session {
+	if s.Auth == nil {
+		return nil
+	}
+	sess, err := s.Auth.SessionFromRequest(r.Context(), r)
+	if err != nil {
+		return nil
+	}
+	return sess
 }
 
 func (s *Server) handleDownloads(w http.ResponseWriter, r *http.Request) {
